@@ -1,0 +1,132 @@
+# Install Required Libraries (Manual installation for non-Colab environments)
+# Ensure the following libraries are installed:
+# - pdf2image
+# - paddleocr
+# - sentence-transformers
+# - faiss-cpu
+# - transformers
+# You can install them using the following commands in your terminal or Jupyter environment:
+# pip install pdf2image paddleocr sentence-transformers faiss-cpu transformers
+
+# Import Libraries
+import os
+from pdf2image import convert_from_path
+from paddleocr import PaddleOCR
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+import faiss
+import numpy as np
+import json
+from google.colab import files
+import cv2
+import re
+
+# Initialize PaddleOCR
+ocr = PaddleOCR(use_angle_cls=True, lang="en")
+
+# Step 1: Extract Text from PDF Images (OCR Fallback)
+def extract_text_from_pdf_images(pdf_path):
+    """Extracts text from a PDF by converting pages into images and using OCR."""
+    images = convert_from_path(pdf_path)
+    all_text = []
+
+    for i, image in enumerate(images):
+        # Save each page as an image
+        image_path = f"page_{i + 1}.jpg"
+        image.save(image_path)
+        
+        # Perform OCR using PaddleOCR
+        result = ocr.ocr(image_path, cls=True)
+        page_text = ""
+        for res in result[0]:
+            if len(res) > 1:
+                text, confidence = res[1]
+                if confidence > 0.5:  # Filter out low-confidence results
+                    page_text += text + " "
+        
+        # Add page text to the list
+        clean_text = re.sub(r'\s+', ' ', page_text.strip())
+        all_text.append(clean_text)
+        os.remove(image_path)  # Clean up images
+
+    final_text = "\n".join(all_text)
+    if not final_text.strip():
+        raise ValueError("The extracted text from the PDF is empty. Ensure OCR is working properly.")
+    return final_text
+
+# Step 2: Create Embeddings for the Text
+def create_embeddings(text, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+    """Generates embeddings for sentences using SentenceTransformer."""
+    sentences = [line.strip() for line in text.split("\n") if line.strip()]
+    if not sentences:
+        raise ValueError("No valid sentences found in the text extracted from the PDF.")
+    
+    embedding_model = SentenceTransformer(model_name)
+    embeddings = embedding_model.encode(sentences, convert_to_tensor=False)
+    if len(embeddings) == 0:
+        raise ValueError("Failed to create embeddings. Ensure the input text is valid.")
+    return sentences, embeddings
+
+# Step 3: Build a FAISS Vector Store
+def build_faiss_index(embeddings):
+    """Creates a FAISS index from the embeddings."""
+    if len(embeddings) == 0:
+        raise ValueError("Embeddings are empty. Cannot build FAISS index.")
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(np.array(embeddings))
+    return index
+
+# Step 4: Perform Retrieval
+def retrieve_context(query, index, sentences, embedding_model, top_k=5):
+    """Retrieves the most relevant sentences for a query using FAISS."""
+    query_embedding = embedding_model.encode([query], convert_to_tensor=True)
+    distances, indices = index.search(np.array(query_embedding), top_k)
+    retrieved_sentences = [sentences[idx] for idx in indices[0]]
+    return retrieved_sentences
+
+# Step 5: Generate Answer using Open-Source LLM
+def generate_answer(context, query, llm_model="google/flan-t5-large"):
+    """Generates an answer using an open-source LLM and retrieved context."""
+    generator = pipeline("text2text-generation", model=llm_model)
+    input_text = f"Context: {' '.join(context)} \n\nQuestion: {query}"
+    result = generator(input_text, max_length=200, truncation=True)
+    return result[0]['generated_text']
+
+# Step 6: Main Workflow
+uploaded = files.upload()
+for filename in uploaded.keys():
+    print(f"Processing file: {filename}")
+
+    try:
+        # Extract text from PDF Images using OCR
+        print("Extracting text using OCR...")
+        text_content = extract_text_from_pdf_images(filename)
+        print("PDF Text Extracted Successfully!")
+
+        # Create embeddings
+        sentences, embeddings = create_embeddings(text_content)
+        print("Embeddings Created Successfully!")
+
+        # Build FAISS index
+        faiss_index = build_faiss_index(np.array(embeddings))
+        print("FAISS Index Built Successfully!")
+
+        # Ask a question
+        question = "What are the unemployment rates and median weekly earnings in the document?"
+        embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        context = retrieve_context(question, faiss_index, sentences, embedding_model)
+        print("Relevant Context Retrieved!")
+
+        # Generate answer
+        answer = generate_answer(context, question)
+        print("\nAnswer:")
+        print(answer)
+
+        # Save the result to a file
+        with open("answer.json", "w") as f:
+            json.dump({"question": question, "answer": answer}, f, indent=4)
+
+        files.download("answer.json")
+    except ValueError as e:
+        print(f"Error: {e}")
